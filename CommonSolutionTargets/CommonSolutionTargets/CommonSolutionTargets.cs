@@ -12,6 +12,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using EnvDTE;
 using EnvDTE80;
 using Microsoft.Build.Evaluation;
@@ -63,6 +64,9 @@ namespace CommonSolutionTargets
         private string VSStd2KCmdIDGuid;
         private string activeBuildTarget;
 
+        private string[] contentOfTargetsFile;
+        private List<Target> targets;
+
         private LoggerVerbosity currentLoggerVerbosity = LoggerVerbosity.Minimal;
 
         /// <summary>
@@ -76,8 +80,6 @@ namespace CommonSolutionTargets
         {
             Debug.WriteLine(string.Format(CultureInfo.CurrentCulture, "Entering constructor for: {0}", this));
         }
-
-
 
         /////////////////////////////////////////////////////////////////////////////
         // Overridden Package Implementation
@@ -133,7 +135,6 @@ namespace CommonSolutionTargets
 
             this.commandEvents = this.dte2.Events.CommandEvents;
             this.commandEvents.BeforeExecute += this.CommandEvents_BeforeExecute;
-
         }
 
         void CommandEvents_BeforeExecute(string Guid, int ID, object CustomIn, object CustomOut, ref bool CancelDefault)
@@ -208,8 +209,140 @@ namespace CommonSolutionTargets
             // This method is called when a build is completed.
             this.WriteLine(LoggerVerbosity.Detailed, "CommonSolutionTargets: UpdateSolution_Done");
 
-            this.activeBuildTarget = null;
-            return 0;
+            //this.activeBuildTarget = null;
+            string solutionFilePath = this.dte2.Solution.FullName;
+            string solutionFolder = Path.GetDirectoryName(solutionFilePath);
+            string solutionFileName = Path.GetFileName(solutionFilePath);
+            string targetsFileName = "after." + solutionFileName + ".targets";
+            if (solutionFolder == null)
+                return VSConstants.E_UNEXPECTED;
+
+            string targetsFilePath = Path.Combine(solutionFolder, targetsFileName);
+
+            if (!File.Exists(targetsFilePath))
+                return VSConstants.S_OK;
+
+            contentOfTargetsFile = File.ReadAllLines(targetsFilePath);
+
+            string solutionConfigurationName = this.dte2.Solution.SolutionBuild.ActiveConfiguration.Name;
+            this.WriteLine(LoggerVerbosity.Detailed, "CommonSolutionTargets: active solution configuration name is \"{0}\"", solutionConfigurationName);
+
+            List<ILogger> loggers = new List<ILogger> { this.MakeBuildLogger() };
+
+            ProjectInstance solutionInitProjectInstance;
+            try
+            {
+                solutionInitProjectInstance = new ProjectInstance(targetsFilePath);
+            }
+            catch (Exception ex)
+            {
+                this.WriteLine(LoggerVerbosity.Detailed, "CommonSolutionTargets: failed to load targets file \"{0}\", Exception: {1}", targetsFilePath, ex);
+                return VSConstants.E_FAIL;
+            }
+
+            FindTargets(solutionInitProjectInstance);
+
+            solutionInitProjectInstance.SetProperty("Configuration", solutionConfigurationName);
+            solutionInitProjectInstance.SetProperty("BuildingInsideVisualStudio", "true");
+            int numberOfPropertiesBeforeBuild = solutionInitProjectInstance.Properties.Count;
+
+            var target = GetActiveBuildTarget(nameof(IVsUpdateSolutionEvents.UpdateSolution_Done));
+
+            this.WriteLine(LoggerVerbosity.Detailed, "CommonSolutionTargets: building targets file \"{0}\", target \"{1}\"", targetsFilePath, string.Join(",", target));
+            solutionInitProjectInstance.Build(target, loggers);
+
+            // If solution targets build produced new custom properties, fetch those and add them to the global properties collection.
+            // Most typical usage for this feature is setting "CustomAfterMicrosoftCommontargets" property.
+            for (int propertyNumber = numberOfPropertiesBeforeBuild;
+                propertyNumber < solutionInitProjectInstance.Properties.Count;
+                propertyNumber++)
+            {
+                ProjectPropertyInstance property = solutionInitProjectInstance.Properties.ElementAt(propertyNumber);
+                if (property.Name.StartsWith("Custom"))
+                {
+                    this.WriteLine(LoggerVerbosity.Detailed, "CommonSolutionTargets: defined global build property {0} = {1}", property.Name, property.EvaluatedValue);
+                    ProjectCollection.GlobalProjectCollection.SetGlobalProperty(property.Name, property.EvaluatedValue);
+                }
+            }
+
+            return VSConstants.S_OK;
+        }
+
+        private string[] GetActiveBuildTarget(string eventName)
+        {
+            switch (eventName)
+            {
+                case nameof(IVsUpdateSolutionEvents.UpdateSolution_Done):
+                    {
+                        //build is done.
+                        return targets.Where(kvp => (kvp.AfterTargets == null ? false : kvp.AfterTargets.Contains("build") || kvp.AfterTargets.Contains("rebuild"))).Select(z => z.Name).ToArray();
+                        break;
+                    }
+                case nameof(IVsUpdateSolutionEvents.UpdateSolution_StartUpdate):
+                    {
+                        return targets.Where(kvp => (kvp.BeforeTargets == null ? false : kvp.BeforeTargets.Contains("build") || kvp.BeforeTargets.Contains("rebuild"))).Select(z => z.Name).ToArray();
+                        break;
+                    }
+            }
+            
+            throw new NotImplementedException();
+        }
+
+        class Target
+        {
+            public Target(string name)
+            {
+                this.Name = name;
+            }
+            public string Name;
+            public string[] BeforeTargets;
+            public string[] AfterTargets;
+        }
+
+        private void FindTargets(ProjectInstance solutionInitProjectInstance)
+        {
+            targets = new List<Target>();
+            foreach (var target in solutionInitProjectInstance.Targets)
+            {
+                var T = new Target(target.Value.Name);
+
+                var beforeLocation = target.Value.BeforeTargetsLocation;
+                if (beforeLocation != null)
+                {
+                    var line = beforeLocation.Line - 1;
+                    var column = beforeLocation.Column - 1;
+                    if (line != -1 && column != -1)
+                    {
+                        var BeforeTarget = contentOfTargetsFile[line].Substring(column);
+                        var match = Regex.Match(BeforeTarget, "BeforeTargets=\"(?<targets>[\\w;,]*)\"");
+                        if (match.Success)
+                        {
+                            T.BeforeTargets = match.Groups["targets"].ToString().ToLowerInvariant().Split(';');
+                        }
+                    }
+                }
+
+                var afterLocation = target.Value.AfterTargetsLocation;
+                if (afterLocation != null)
+                {
+                    var line = afterLocation.Line - 1;
+                    var column = afterLocation.Column - 1;
+                    if (line != -1 && column != -1)
+                    {
+                        var AfterTarget = contentOfTargetsFile[line].Substring(column);
+                        var match = Regex.Match(AfterTarget, "AfterTargets=\"(?<targets>[\\w;,]*)\"");
+                        if (match.Success)
+                        {
+                            T.AfterTargets = match.Groups["targets"].ToString().ToLowerInvariant().Split(';');
+                        }
+                    }
+                }
+
+                if (T.BeforeTargets != null || T.AfterTargets != null)
+                {
+                    targets.Add(T);
+                }
+            }
         }
 
         /// <summary>
@@ -254,8 +387,11 @@ namespace CommonSolutionTargets
             solutionInitProjectInstance.SetProperty("Configuration", solutionConfigurationName);
             solutionInitProjectInstance.SetProperty("BuildingInsideVisualStudio", "true");
             int numberOfPropertiesBeforeBuild = solutionInitProjectInstance.Properties.Count;
-            this.WriteLine(LoggerVerbosity.Detailed, "CommonSolutionTargets: building targets file \"{0}\", target \"{1}\"", targetsFilePath, this.activeBuildTarget);
-            solutionInitProjectInstance.Build(this.activeBuildTarget, loggers);
+
+            var target = GetActiveBuildTarget(nameof(IVsUpdateSolutionEvents.UpdateSolution_StartUpdate));
+
+            this.WriteLine(LoggerVerbosity.Detailed, "CommonSolutionTargets: building targets file \"{0}\", target \"{1}\"", targetsFilePath, string.Join(",", target));
+            solutionInitProjectInstance.Build(target, loggers);
 
             // If solution targets build produced new custom properties, fetch those and add them to the global properties collection.
             // Most typical usage for this feature is setting "CustomAfterMicrosoftCommontargets" property.

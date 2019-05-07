@@ -8,18 +8,6 @@
     </PropertyGroup>
   </Target>
   <Target Name="AfterBuild" AfterTargets="Build;Rebuild" >
-    <!-- We get here still before the build, not after, because this whole targets file is executed before the build. -->
-  </Target>
-  
-  <!-- All four standard targets must be present, otherwise VS barfs. -->
-  <Target Name="Build">
-    <Message Text="Solution Build target" Importance="High"/>
-  </Target>
-  <Target Name="Rebuild">
-    <Message Text="Solution Rebuild target" Importance="High"/>
-  </Target>
-  <Target Name="Clean">
-  </Target>
-  <Target Name="Publish">
+    <!-- We only get here still after the build. -->
   </Target>
 </Project>
